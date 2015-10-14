@@ -27,6 +27,8 @@ namespace ZooKeeperNet
 
         private readonly ConcurrentQueue<Packet> pendingQueue = new ConcurrentQueue<Packet>();
         private readonly LinkedList<Packet> outgoingQueue = new LinkedList<Packet>();
+        private readonly AutoResetEvent packetAre = new AutoResetEvent(false);
+
         public int PendingQueueCount
         {
             get
@@ -79,7 +81,6 @@ namespace ZooKeeperNet
 
         public void Start()
         {
-            StartConnect();
             requestThread.Start();
         }
 
@@ -101,26 +102,37 @@ namespace ZooKeeperNet
                 if (h.Type == (int)OpCode.CloseSession)
                     closing = true;
                 // enqueue the packet when zookeeper is connected
-                lock (outgoingQueue)
-                {
-                    outgoingQueue.AddLast(p);
-                }
+                addPacketLast(p);
             }
             return p;
         }
 
+        private void addPacketFirst(Packet p)
+        {
+            outgoingQueue.AddFirst(p);
+            
+        }
+        private void addPacketLast(Packet p)
+        {
+            lock (outgoingQueue)
+            {
+                outgoingQueue.AddLast(p);
+            }
+            packetAre.Set();
+        }
+
         private void SendRequests()
         {
-            DateTime now = DateTime.Now;
+            DateTime now = DateTime.UtcNow;
             DateTime lastSend = now;
             Packet packet = null;
-            SpinWait spin = new SpinWait();
+
             while (zooKeeper.State.IsAlive())
             {
                 try
                 {
-                    now = DateTime.Now;
-                    if (client == null || !client.Connected || zooKeeper.State == ZooKeeper.States.NOT_CONNECTED)
+                    now = DateTime.UtcNow;
+                    if ((client == null || client.Client == null) || (!client.Connected || zooKeeper.State == ZooKeeper.States.NOT_CONNECTED))
                     {
                         // don't re-establish connection if we are closing
                         if(conn.IsClosed || closing)
@@ -147,21 +159,18 @@ namespace ZooKeeperNet
                         {
                             packet = outgoingQueue.First();
                             outgoingQueue.RemoveFirst();
-                            // We have something to send so it's the same
-                            // as if we do the send now.                        
-                            DoSend(packet);
-                            lastSend = DateTime.Now;
-                            packet = null;
-                        }
-                        else
-                        {
-                            // spin the processor
-                            spin.SpinOnce();
-                            if (spin.Count > ClientConnection.maxSpin)
-                                // reset the spinning counter
-                                spin.Reset();
                         }
                     }
+                    if (packet != null)
+                    {
+                        // We have something to send so it's the same
+                        // as if we do the send now.                        
+                        DoSend(packet);
+                        lastSend = DateTime.UtcNow;
+                        packet = null;
+                    }
+                    else
+                        packetAre.WaitOne(TimeSpan.FromMilliseconds(1));
                 }
                 catch (Exception e)
                 {
@@ -223,10 +232,6 @@ namespace ZooKeeperNet
                     if (LOG.IsDebugEnabled)
                         LOG.Debug("Ignoring exception during channel close", e);
                 }
-                finally
-                {
-                    tcpClient = null;
-                }
             }
 
             lock (outgoingQueue)
@@ -246,6 +251,7 @@ namespace ZooKeeperNet
         private void Cleanup()
         {
             Cleanup(client);
+            client = null;
         }
 
         private void StartConnect()
@@ -303,6 +309,7 @@ namespace ZooKeeperNet
                     if (!ar.AsyncWaitHandle.WaitOne(conn.ConnectionTimeout, false))
                     {
                         Cleanup(tempClient);
+                        tempClient = null;
                         throw new TimeoutException();
                     }
 
@@ -317,7 +324,7 @@ namespace ZooKeeperNet
                     if (ex is SocketException || ex is TimeoutException)
                     {
                         Cleanup(tempClient);
-
+                        tempClient = null;
                         zkEndpoints.CurrentEndPoint.SetAsFailure();
 
                         LOG.ErrorFormat(string.Format("Failed to connect to {0}:{1}.",
@@ -372,7 +379,14 @@ namespace ZooKeeperNet
                 if (client == null)
                     return;
                 NetworkStream stream = client.GetStream();
-                len = stream.EndRead(ar);
+
+                try
+                {
+                    len = stream.EndRead(ar);
+                }
+                catch
+                {
+                }
                 if (len == 0) //server closed the connection...
                 {
                     LOG.Debug("TcpClient connection lost.");
@@ -429,30 +443,32 @@ namespace ZooKeeperNet
 
             lock (outgoingQueue)
             {
-                if (!ClientConnection.disableAutoWatchReset && (!zooKeeper.DataWatches.IsEmpty() || !zooKeeper.ExistWatches.IsEmpty() || !zooKeeper.ChildWatches.IsEmpty()))
+                if (!ClientConnection.DisableAutoWatchReset && (!zooKeeper.DataWatches.IsEmpty() || !zooKeeper.ExistWatches.IsEmpty() || !zooKeeper.ChildWatches.IsEmpty()))
                 {
                     var sw = new SetWatches(lastZxid, zooKeeper.DataWatches, zooKeeper.ExistWatches, zooKeeper.ChildWatches);
                     var h = new RequestHeader();
                     h.Type = (int)OpCode.SetWatches;
                     h.Xid = -8;
                     Packet packet = new Packet(h, new ReplyHeader(), sw, null, null, null, null, null);
-                    outgoingQueue.AddFirst(packet);
+                    //outgoingQueue.AddFirst(packet);
+                    addPacketFirst(packet);
                 }
 
                 foreach (ClientConnection.AuthData id in conn.authInfo)
-                    outgoingQueue.AddFirst(
+                    addPacketFirst(
                         new Packet(new RequestHeader(-4, (int) OpCode.Auth), null, new AuthPacket(0, id.Scheme, id.GetData()), null, null, null, null, null));
 
-                outgoingQueue.AddFirst(new Packet(null, null, conReq, null, null, null, null, null));
+                addPacketFirst(new Packet(null, null, conReq, null, null, null, null, null));
+                
             }
-
+            packetAre.Set();
             if (LOG.IsDebugEnabled)
                 LOG.DebugFormat("Session establishment request sent on {0}",client.Client.RemoteEndPoint);
         }
 
         private void SendPing()
         {
-            lastPingSentNs = DateTime.Now.Nanos();
+            lastPingSentNs = DateTime.UtcNow.Nanos();
             RequestHeader h = new RequestHeader(-2, (int)OpCode.Ping);
             conn.QueuePacket(h, null, null, null, null, null, null, null, null);
         }
@@ -481,7 +497,7 @@ namespace ZooKeeperNet
             using (EndianBinaryReader reader = new EndianBinaryReader(EndianBitConverter.Big, new MemoryStream(content), Encoding.UTF8))
             {
                 int len = reader.ReadInt32();
-                if (len < 0 || len >= ClientConnection.packetLen)
+                if (len < 0 || len >= ClientConnection.MaximumPacketLength)
                     throw new IOException(new StringBuilder("Packet len ").Append(len).Append("is out of range!").ToString());
                 return len;
             }
@@ -524,7 +540,7 @@ namespace ZooKeeperNet
                 {
                     // -2 is the xid for pings
                     if (LOG.IsDebugEnabled)
-                        LOG.DebugFormat("Got ping response for sessionid: 0x{0:X} after {1}ms", conn.SessionId, (DateTime.Now.Nanos() - lastPingSentNs) / 1000000);
+                        LOG.DebugFormat("Got ping response for sessionid: 0x{0:X} after {1}ms", conn.SessionId, (DateTime.UtcNow.Nanos() - lastPingSentNs) / 1000000);
                     return;
                 }
                 if (replyHdr.Xid == -4)

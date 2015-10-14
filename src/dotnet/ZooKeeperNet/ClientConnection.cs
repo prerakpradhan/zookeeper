@@ -15,12 +15,14 @@
  *  limitations under the License.
  *
  */
-﻿namespace ZooKeeperNet
+
+namespace ZooKeeperNet
 {
     using System;
     using System.Collections.Generic;
     using System.Linq;
     using System.Net;
+    using System.Net.Sockets;
     using System.Text;
     using System.Threading;
     using log4net;
@@ -31,11 +33,59 @@
     {
         private static readonly ILog LOG = LogManager.GetLogger(typeof(ClientConnection));
 
-        //TODO find an elegant way to set this parameter
-        public const int packetLen = 4096 * 1024;
-        internal static readonly bool disableAutoWatchReset = false;
-        private static readonly TimeSpan defaultConnectTimeout = new TimeSpan(0, 0, 0, 0, 500);
-        internal const int maxSpin = 30;
+        private static readonly TimeSpan DefaultConnectTimeout = TimeSpan.FromMilliseconds(500);        
+        private static bool disableAutoWatchReset = false;
+        private static int maximumPacketLength = 1024 * 1024 * 4;
+        private static int maximumSpin = 30;
+
+        /// <summary>
+        /// Gets a value indicating how many times we should spin during waits.
+        /// Defaults to 30.
+        /// </summary>
+        public static int MaximumSpin
+        {
+            get { return maximumSpin; }
+            set
+            {
+                if (value <= 0)
+                {
+                    string message = string.Format("Cannot set property '{0}' to less than zero. Value is: {1}.", "MaximumSpin", value);
+                    throw new InvalidOperationException(message);
+                }
+
+                maximumSpin = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets a value indicating the maximum packet length allowed.
+        /// Defaults to 4,194,304 (4MB).
+        /// </summary>
+        public static int MaximumPacketLength
+        {
+            get { return maximumPacketLength; }
+            set
+            {
+                if (value <= 0)
+                {
+                    string message = string.Format("Cannot set property '{0}' to less than zero. Value is: {1}.", "MaximumPacketLength", value);
+                    throw new InvalidOperationException(message);
+                }
+
+                maximumPacketLength = value;
+                
+            }
+        }
+
+        /// <summary>
+        /// Gets a value indicating if auto watch reset should be disabled or not.
+        /// Defaults to <c>false</c>.
+        /// </summary>
+        public static bool DisableAutoWatchReset
+        {
+            get { return disableAutoWatchReset; }
+            set { disableAutoWatchReset = value; }
+        }
 
         //static ClientConnection()
         //{
@@ -69,10 +119,10 @@
                 return Interlocked.CompareExchange(ref isClosed, 0, 0) == 1;
             }
         }
+
         internal ClientConnectionRequestProducer producer;
         internal ClientConnectionEventConsumer consumer;
-
-
+        
         /// <summary>
         /// Initializes a new instance of the <see cref="ClientConnection"/> class.
         /// </summary>
@@ -81,7 +131,7 @@
         /// <param name="zooKeeper">The zoo keeper.</param>
         /// <param name="watcher">The watch manager.</param>
         public ClientConnection(string connectionString, TimeSpan sessionTimeout, ZooKeeper zooKeeper, ZKWatchManager watcher):
-            this(connectionString, sessionTimeout, zooKeeper, watcher, 0, new byte[16], defaultConnectTimeout)
+            this(connectionString, sessionTimeout, zooKeeper, watcher, 0, new byte[16], DefaultConnectTimeout)
         {
         }
 
@@ -109,7 +159,7 @@
         /// <param name="sessionId">The session id.</param>
         /// <param name="sessionPasswd">The session passwd.</param>
         public ClientConnection(string hosts, TimeSpan sessionTimeout, ZooKeeper zooKeeper, ZKWatchManager watcher, long sessionId, byte[] sessionPasswd)
-            : this(hosts, sessionTimeout, zooKeeper, watcher, 0, new byte[16], defaultConnectTimeout)
+            : this(hosts, sessionTimeout, zooKeeper, watcher, 0, new byte[16], DefaultConnectTimeout)
         {
         }
 
@@ -176,6 +226,7 @@
         private void GetHosts(string hostLst)
         {
             string[] hostsList = hostLst.Split(',');
+            List<IPEndPoint> nonRandomizedServerAddrs = new List<IPEndPoint>();
             foreach (string h in hostsList)
             {
                 string host = h;
@@ -190,11 +241,51 @@
                     }
                     host = h.Substring(0, pidx);
                 }
-                var ip = IPAddress.Parse(host);
-                serverAddrs.Add(new IPEndPoint(ip, port));
-            }
 
-            serverAddrs.OrderBy(s => Guid.NewGuid()); //Random order the servers
+                // Handle dns-round robin or hostnames instead of IP addresses
+                var hostIps = ResolveHostToIpAddresses(host);
+                foreach (var ip in hostIps)
+                {
+                    nonRandomizedServerAddrs.Add(new IPEndPoint(ip, port));
+                }
+            }
+            IEnumerable<IPEndPoint> randomizedServerAddrs 
+                = nonRandomizedServerAddrs.OrderBy(s => Guid.NewGuid()); //Random order the servers
+
+            serverAddrs.AddRange(randomizedServerAddrs);
+        }
+
+        private IEnumerable<IPAddress> ResolveHostToIpAddresses(string host)
+        {
+            // if the host represents an explicit IP address, use it directly. otherwise
+            // lookup the name into it's IP addresses
+            IPAddress parsedAddress;
+            if (IPAddress.TryParse(host, out parsedAddress))
+            {
+                yield return parsedAddress;
+            }
+            else
+            {
+                IPHostEntry hostEntry = Dns.GetHostEntry(host);
+                IEnumerable<IPAddress> addresses = hostEntry.AddressList.Where(IsAllowedAddressFamily);
+                foreach (IPAddress address in addresses)
+                {
+                    yield return address;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Checks to see if the specified address has an allowable address family.
+        /// </summary>
+        /// <param name="address">The adress to check.</param>
+        /// <returns>
+        /// <c>true</c> if the address is in the allowable address families, otherwise <c>false</c>.
+        /// </returns>
+        private static bool IsAllowedAddressFamily(IPAddress address)
+        {
+            // in the future, IPv6 (AddressFamily.InterNetworkV6) should be supported
+            return address.AddressFamily == AddressFamily.InterNetwork;
         }
 
         private void SetTimeouts(TimeSpan sessionTimeout)
@@ -255,18 +346,10 @@
         {
             ReplyHeader r = new ReplyHeader();
             Packet p = QueuePacket(h, r, request, response, null, null, watchRegistration, null, null);
-            SpinWait spin = new SpinWait();
-            DateTime start = DateTime.Now;
-            // now wait for reply for the packet
-            while (!p.Finished)
+            
+            if (!p.WaitUntilFinishedSlim(SessionTimeout))
             {
-                spin.SpinOnce();
-                if (spin.Count > ClientConnection.maxSpin)
-                {
-                    if(DateTime.Now.Subtract(start) > SessionTimeout)
-                        throw new TimeoutException(new StringBuilder("The request ").Append(request).Append(" timed out while waiting for a response from the server.").ToString());
-                    spin.Reset();
-                }
+                throw new TimeoutException(new StringBuilder("The request ").Append(request).Append(" timed out while waiting for a response from the server.").ToString());
             }
             return r;
         }
@@ -291,11 +374,19 @@
                 {
                     SubmitRequest(new RequestHeader { Type = (int)OpCode.CloseSession }, null, null, null);
                     SpinWait spin = new SpinWait();
+                    DateTime timeoutAt = DateTime.UtcNow.Add(SessionTimeout);
                     while (!producer.IsConnectionClosedByServer)
                     {
                         spin.SpinOnce();
-                        if (spin.Count > maxSpin)
+                        if (spin.Count > MaximumSpin)
+                        {
+                            if (timeoutAt <= DateTime.UtcNow)
+                            {
+                                throw new TimeoutException(
+                                    string.Format("Timed out in Dispose() while closing session: 0x{0:X}", SessionId));
+                            }
                             spin.Reset();
+                        }
                     }
                 }
                 catch (ThreadInterruptedException)
